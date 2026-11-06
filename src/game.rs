@@ -51,6 +51,8 @@ pub struct SkinIndex {
     pub cues: HashMap<String, HashMap<String, String>>,
     /// Skins with particle systems of their own (VFX/Particles/Characters/{hero}/{skin}/).
     pub vfx: HashSet<String>,
+    /// Peni's pilot meshes per skin: 1042_Girl/Meshes/SK_1042_Girl_{skin} -> package.
+    pub girl: HashMap<String, String>,
 }
 
 impl Game {
@@ -209,6 +211,7 @@ impl Game {
             let cue_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/Cues/(.+))\.uasset$").unwrap();
             let lobby_mi_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/Materials/(?:[^/]*/)?Lobby/(?:[^/]*/)?MI_(\d{7})_([^/]+))\.uasset$").unwrap();
             let bp_re = regex::Regex::new(r"/Characters/\d{4}/(\d{7})/(\d{7})_ChildBP\.uasset$").unwrap();
+                        let girl_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/\d{4}_Girl/Meshes/SK_\d{4}_Girl_(\d{7}))\.uasset$").unwrap();
             let mut index = SkinIndex::default();
             for c in self.store.chunks().filter(|c| c.id().get_chunk_type() == EIoChunkType::ExportBundleData) {
                 let Some(path) = c.path() else { continue };
@@ -235,6 +238,12 @@ impl Game {
                 if let Some(m) = lobby_mi_re.captures(&path) {
                     if m[2] == m[3] {
                         index.lobby_materials.entry(m[2].to_string()).or_default().insert(m[4].to_string(), format!("/Game/{}", &m[1]));
+                    }
+                    continue;
+                }
+                if let Some(m) = girl_re.captures(&path) {
+                    if m[3] == m[4] {
+                        index.girl.insert(m[3].to_string(), format!("/Game/{}", &m[1]));
                     }
                     continue;
                 }
