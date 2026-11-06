@@ -155,6 +155,21 @@ pub fn create(
                 }
             }
         }
+        // Peni's pilot ("Girl" mesh): the emote montages spawn the default skin's
+        // Girl, so the skin's Girl takes its place, as the main mesh does.
+        if retexture.is_none() {
+            if let (Some(package), Some(target)) =
+                (index.girl.get(mesh_skin), index.girl.get(target_id))
+            {
+                let name = package.rsplit('/').next().unwrap_or(package);
+                log(format!("Extracting {name}..."));
+                let girl = game.extract_package(package, &work_dir.join("extract"))?;
+                stage(&girl, &content_dir, target)?;
+                let dst = content_dir.join(target.trim_start_matches("/Game/"));
+                let old = relocate_package(&dst.with_extension("uasset"), target, &HashMap::new())?;
+                log(format!("  Girl: {old} -> {target}"));
+            }
+        }
         ensure!(
             !packed.is_empty(),
             "The default skin has no mesh for any of this skin's forms."
@@ -221,16 +236,15 @@ pub fn create(
             target_id,
             options,
         );
-        let overrides: Vec<_> = overrides
+                let overrides: Vec<_> = overrides
             .into_iter()
             .filter(|(p, _)| {
-                !content_dir
-                    .join(p.trim_start_matches("/Game/"))
-                    .with_extension("uasset")
-                    .exists()
+                !content_dir.join(p.trim_start_matches("/Game/")).with_extension("uasset").exists()
             })
+            .filter(|(p, _)| !(p.contains("/Animations/Emotes/") && !p.contains("Lobby")))
             .collect();
-        for (package, renames) in &overrides {
+                for (package, renames) in &overrides {
+            log(format!("    override: {package}"));
             let file = game.extract_package(package, &work_dir.join("extract"))?;
             let dst = stage(&file, &content_dir, package)?;
             relocate_package(&dst, package, renames)?;
