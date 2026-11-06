@@ -17,10 +17,22 @@ static VARIANT_CUE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(.*)_\d{3}_
 
 const LOCRES_PATH: &str = "Marvel/Content/Localization/Game/en/Game.locres";
 /// Bump when the build rules change so old caches get rebuilt.
-const DB_VERSION: u32 = 15;
+const DB_VERSION: u32 = 18;
 
 /// Fixes for names the localization stores oddly: (char_id, display name).
 const CHAR_NAME_OVERRIDES: &[(&str, &str)] = &[];
+
+const SKIN_NAME_OVERRIDES: &[(&str, &str)] = &[
+    ("1061303", "Fatal Weaver"),
+    ("1041306", "Celestial Soldier"),
+    ("1015800", "Storm - Marvel Tōkon: Fighting Souls"),
+    ("1034802", "Iron-Man - Marvel Tōkon: Fighting Souls"),
+    ("1059304", "Gothic Huntress"),
+    ("1047507", "Sharknos"),
+    ("1022802", "Captain America: The Winter Soldier"),
+    ("1036803", "Worthy Spider-Man"),
+    ("1051506", "Cosmic Cook"),
+];
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Skin {
@@ -555,11 +567,20 @@ fn char_names(flat: &HashMap<String, String>) -> HashMap<String, String> {
 /// localization names it.
 pub fn build(flat: &HashMap<String, String>, index: &SkinIndex) -> Vec<Character> {
     let names = char_names(flat);
-    let mut skin_names = skin_names(flat);
+       let mut skin_names = skin_names(flat);
+    for (id, name) in SKIN_NAME_OVERRIDES {
+        skin_names.insert(id.to_string(), name.to_string());
+    }
     for id in index.meshes.keys() {
-        skin_names
-            .entry(id.clone())
-            .or_insert_with(|| format!("Skin {id}"));
+        skin_names.entry(id.clone()).or_insert_with(|| {
+            // Default skin (…001) without a name: use the hero's name.
+            if id.ends_with("001") {
+                if let Some(hero) = id.get(..4).and_then(|c| names.get(c)) {
+                    return hero.clone();
+                }
+            }
+            format!("Skin {id}")
+        });
     }
     let mut skins_by_char: HashMap<String, Vec<Skin>> = HashMap::new();
     for (id, name) in skin_names {
