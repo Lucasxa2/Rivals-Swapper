@@ -43,7 +43,7 @@ Swaps made with older versions that used Project Galacta keep working as long as
 Download the latest release for your OS, extract it, and run `RivalsSwapper`.
 
 To build from source (Rust 1.88+):
-
+If you already had the nyakuoff rust version i recommend re-build the shaders to make 100% sure your game and app open propely
 ```bash
 cargo run --release
 ```
