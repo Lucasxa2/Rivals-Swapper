@@ -1127,7 +1127,12 @@ fn paint_image(ui: &egui::Ui, path: &Path, rect: egui::Rect, dim: bool) {
 /// Same, showing only the `uv` part of the image (0..1 coordinates).
 fn paint_image_uv(ui: &egui::Ui, path: &Path, rect: egui::Rect, dim: bool, uv: egui::Rect) {
     if path.exists() {
-        egui::Image::new(format!("file://{}", path.display()))
+                let p = path.display().to_string().replace('\\', "/");
+        let uri = if p.starts_with('/') { format!("file://{p}") } else { format!("file:///{p}") };
+        if let Err(e) = ui.ctx().try_load_image(&uri, egui::load::SizeHint::default()) {
+            eprintln!("[img-debug] {uri}: {e}");
+        }
+        egui::Image::new(uri)
             .uv(uv)
             .tint(if dim {
                 Color32::from_gray(80)
