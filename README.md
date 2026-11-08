@@ -17,8 +17,8 @@ All Credits to the real creator of the app nyakuoff -The Goat-
 
 ## Updates
 
-- ** Most characters like The Punisher, Elsa BloodStone, Black Widow and Star Lord should change weapons
-- ** Deadpool and Namor Weapons change but has the wrong textures
+- **Most characters like The Punisher, Elsa BloodStone, Black Widow and Star Lord should change weapons
+- **Deadpool and Namor Weapons change but has the wrong textures
 
 ## Prerequisites
 
