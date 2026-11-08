@@ -1,4 +1,4 @@
-# Rivals Swapper
+# Rivals Swapper - DO NOT USE THIS VERSION use the rust version, just click where it says (main) and change to rust
 
 A Marvel Rivals skin changer tool that lets you swap character skins.
 
