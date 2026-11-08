@@ -51,8 +51,12 @@ pub struct SkinIndex {
     pub cues: HashMap<String, HashMap<String, String>>,
     /// Skins with particle systems of their own (VFX/Particles/Characters/{hero}/{skin}/).
     pub vfx: HashSet<String>,
-    /// Peni's pilot meshes per skin: 1042_Girl/Meshes/SK_1042_Girl_{skin} -> package.
+        /// Peni's pilot meshes per skin: 1042_Girl/Meshes/SK_1042_Girl_{skin} -> package.
     pub girl: HashMap<String, String>,
+    /// Peni's shoulder cannons per skin: (weapon folder, package), e.g. ("Launcher_L", ...).
+    pub cannons: HashMap<String, Vec<(String, String)>>,
+pub weapon_mats: HashMap<String, HashMap<String, String>>,
+pub weapon_mats_lobby: HashMap<String, HashMap<String, String>>,
 }
 
 impl Game {
@@ -205,6 +209,8 @@ impl Game {
 
     pub fn skins(&self) -> &SkinIndex {
         self.skins.get_or_init(|| {
+use std::io::Write as _;
+let mut dump = std::env::var("RS_DUMP_WEAPONS").ok().and_then(|p| std::fs::File::create(p).ok());
             let mesh_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/Mesh(?:es)?/(?:(\d{4,5})/)?SK_\d{4,5}_(\d{7})(_Lobby)?)\.uasset$").unwrap();
             let sound_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/(\d{7})_((?:GAS_)?SoundTable))\.uasset$").unwrap();
             let vfx_re = regex::Regex::new(r"Marvel/Content/Marvel/VFX/Particles/Characters/\d{4}/(\d{7})/").unwrap();
@@ -212,9 +218,16 @@ impl Game {
             let lobby_mi_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/Materials/(?:[^/]*/)?Lobby/(?:[^/]*/)?MI_(\d{7})_([^/]+))\.uasset$").unwrap();
             let bp_re = regex::Regex::new(r"/Characters/\d{4}/(\d{7})/(\d{7})_ChildBP\.uasset$").unwrap();
                         let girl_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/\d{4}_Girl/Meshes/SK_\d{4}_Girl_(\d{7}))\.uasset$").unwrap();
+            let weapon_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/Weapons/(?:([^/]+)/)?Mesh(?:es|s)?/([^/]+))\.uasset$").unwrap();
+let wmat_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/Weapons/((?:[^/]+/)*?)MI_(?:[A-Za-z]+_)?(\d{7})_([^/]+))\.uasset$").unwrap();
             let mut index = SkinIndex::default();
+let skip: Vec<String> = std::env::var("RS_SKIP_WEAPONS").unwrap_or_default()
+    .to_ascii_lowercase().split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
             for c in self.store.chunks().filter(|c| c.id().get_chunk_type() == EIoChunkType::ExportBundleData) {
                 let Some(path) = c.path() else { continue };
+if path.contains("/Weapons/") {
+    if let Some(f) = dump.as_mut() { let _ = writeln!(f, "{path}"); }
+}
                 if let Some(m) = bp_re.captures(&path) {
                     if m[1] == m[2] {
                         index.blueprints.insert(m[1].to_string());
@@ -241,14 +254,41 @@ impl Game {
                     }
                     continue;
                 }
+if let Some(m) = wmat_re.captures(&path) {
+    let dirs = m[4].to_ascii_lowercase();
+    if m[3] == m[5] && !["mvp", "emote", "hovertofull"].iter().any(|w| dirs.contains(*w)) {
+        let map = if dirs.contains("lobby") { &mut index.weapon_mats_lobby } else { &mut index.weapon_mats };
+        map.entry(m[3].to_string()).or_default()
+            .entry(m[6].to_string())
+            .or_insert_with(|| format!("/Game/{}", &m[1]));
+    }
+    continue;
+}
+              if let Some(m) = weapon_re.captures(&path) {
+    let (hero, skin, file) = (&m[2], &m[3], &m[5]);
+let dir = m.get(4).map_or("", |d| d.as_str());
+    let lower = file.to_ascii_lowercase();
+    let is_mesh = !(lower.ends_with("_skeleton") || lower.contains("physics"));
+    if is_mesh && skin.starts_with(hero) && file.contains(skin) {
+        let key = format!("{dir}/{file}")
+            .to_ascii_lowercase()
+            .replace(&format!("{hero}_{skin}"), "{id}")
+            .replace(skin, "{id}");
+        if skip.iter().any(|s| key.contains(s.as_str())) { continue; }   // <-- linha nova
+        let list = index.cannons.entry(skin.to_string()).or_default();
+        if !list.iter().any(|(d, _)| d == &key) {
+            list.push((key, format!("/Game/{}", &m[1])));
+        }
+        continue;
+    }
+}
                 if let Some(m) = girl_re.captures(&path) {
                     if m[3] == m[4] {
                         index.girl.insert(m[3].to_string(), format!("/Game/{}", &m[1]));
                     }
                     continue;
                 }
-                let Some(m) = mesh_re.captures(&path) else { continue };
-                let (hero, skin) = (&m[2], &m[3]);
+                let Some(m) = mesh_re.captures(&path) else { continue };                let (hero, skin) = (&m[2], &m[3]);
                 if !skin.starts_with(hero) {
                     continue;
                 }
@@ -269,6 +309,34 @@ impl Game {
                     None => list.push((form, package)),
                 }
             }
+// Fallback: same weapon folder, a single non-lobby mesh on each side, different file naming
+// (e.g. Star-Lord's "Gun_R" in the default skin vs "Gun" in others).
+let snapshot = index.cannons.clone();
+let dir_of = |k: &str| k.split('/').next().unwrap_or("").to_string();
+for (skin, list) in index.cannons.iter_mut() {
+    if skin.len() != 7 || skin.ends_with("001") {
+        continue;
+    }
+    let Some(default) = snapshot.get(&format!("{}001", &skin[..4])) else { continue };
+    for (dk, _) in default.iter().filter(|(k, _)| !k.contains("_lobby")) {
+        let dd = dir_of(dk);
+        if default.iter().filter(|(k, _)| !k.contains("_lobby") && dir_of(k) == dd).count() != 1 {
+            continue;
+        }
+        if list.iter().any(|(k, _)| k == dk) {
+            continue;
+        }
+        let cands: Vec<usize> = list
+            .iter()
+            .enumerate()
+            .filter(|(_, (k, _))| !k.contains("_lobby") && dir_of(k) == dd && !default.iter().any(|(d, _)| d == k))
+            .map(|(i, _)| i)
+            .collect();
+        if cands.len() == 1 {
+            list[cands[0]].0 = dk.clone();
+        }
+    }
+}
             for list in index.meshes.values_mut().chain(index.lobby.values_mut()) {
                 list.sort();
             }
