@@ -1,6 +1,7 @@
 # Rivals Swapper
 
 A Marvel Rivals skin changer tool that lets you swap character skins.
+
 All Credits to the real creator of the app nyakuoff -The Goat-
 > **Client-side cosmetic only** | does not modify game logic or provide any competitive advantage.
 
