@@ -1,7 +1,7 @@
 # Rivals Swapper
 
 A Marvel Rivals skin changer tool that lets you swap character skins.
-
+All Credits to the real creator of the app nyakuoff -The Goat-
 > **Client-side cosmetic only** | does not modify game logic or provide any competitive advantage.
 
 ---
@@ -13,6 +13,11 @@ A Marvel Rivals skin changer tool that lets you swap character skins.
 - **Automatic skin database**: read straight from the game's localization and rebuilt by itself after every game update, so there's nothing to export or download
 - **Swaps recolors too**: recolor skins are rebuilt from the skin they recolor, and multi-form heroes are covered form by form
 - **Native and light**: a single Rust binary for Windows and Linux, around 100 MB of RAM while idle
+
+## Updates
+
+- ** Most characters like The Punisher, Elsa BloodStone, Black Widow and Star Lord should change weapons
+- ** Deadpool and Namor Weapons change but has the wrong textures
 
 ## Prerequisites
 
