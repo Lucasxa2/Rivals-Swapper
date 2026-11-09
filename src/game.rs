@@ -51,12 +51,16 @@ pub struct SkinIndex {
     pub cues: HashMap<String, HashMap<String, String>>,
     /// Skins with particle systems of their own (VFX/Particles/Characters/{hero}/{skin}/).
     pub vfx: HashSet<String>,
-        /// Peni's pilot meshes per skin: 1042_Girl/Meshes/SK_1042_Girl_{skin} -> package.
+    /// Peni's pilot meshes per skin: 1042_Girl/Meshes/SK_1042_Girl_{skin} -> package.
     pub girl: HashMap<String, String>,
-    /// Peni's shoulder cannons per skin: (weapon folder, package), e.g. ("Launcher_L", ...).
+    /// Weapon meshes per skin: (key, package). The key is "<weapon folder>/<file>" lowercased
+    /// with the skin id replaced by "{id}", so the same weapon matches across skins
+    /// (e.g. "launcher_l/sk_wp_{id}_launcher_l").
     pub cannons: HashMap<String, Vec<(String, String)>>,
-pub weapon_mats: HashMap<String, HashMap<String, String>>,
-pub weapon_mats_lobby: HashMap<String, HashMap<String, String>>,
+    /// Weapon material instances per skin: slot suffix -> package (outside Lobby folders).
+    pub weapon_mats: HashMap<String, HashMap<String, String>>,
+    /// Same, for materials in Lobby folders.
+    pub weapon_mats_lobby: HashMap<String, HashMap<String, String>>,
 }
 
 impl Game {
@@ -209,8 +213,6 @@ impl Game {
 
     pub fn skins(&self) -> &SkinIndex {
         self.skins.get_or_init(|| {
-use std::io::Write as _;
-let mut dump = std::env::var("RS_DUMP_WEAPONS").ok().and_then(|p| std::fs::File::create(p).ok());
             let mesh_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/Mesh(?:es)?/(?:(\d{4,5})/)?SK_\d{4,5}_(\d{7})(_Lobby)?)\.uasset$").unwrap();
             let sound_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/(\d{7})_((?:GAS_)?SoundTable))\.uasset$").unwrap();
             let vfx_re = regex::Regex::new(r"Marvel/Content/Marvel/VFX/Particles/Characters/\d{4}/(\d{7})/").unwrap();
@@ -225,9 +227,6 @@ let skip: Vec<String> = std::env::var("RS_SKIP_WEAPONS").unwrap_or_default()
     .to_ascii_lowercase().split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
             for c in self.store.chunks().filter(|c| c.id().get_chunk_type() == EIoChunkType::ExportBundleData) {
                 let Some(path) = c.path() else { continue };
-if path.contains("/Weapons/") {
-    if let Some(f) = dump.as_mut() { let _ = writeln!(f, "{path}"); }
-}
                 if let Some(m) = bp_re.captures(&path) {
                     if m[1] == m[2] {
                         index.blueprints.insert(m[1].to_string());
