@@ -167,133 +167,208 @@ pub fn create(
                 stage(&girl, &content_dir, target)?;
                 let dst = content_dir.join(target.trim_start_matches("/Game/"));
                 let old = relocate_package(&dst.with_extension("uasset"), target, &HashMap::new())?;
-                                log(format!("  Girl: {old} -> {target}"));
+                log(format!("  Girl: {old} -> {target}"));
             }
         }
-                // Peni's shoulder cannons: the lobby show actor loads the default skin's
-        // cannons, so the skin's take their place.
-        if retexture.is_none() {
+        // Weapons. The lobby show actor and the match load the default skin's weapon
+        // meshes and materials, so the skin's take their place: meshes are moved onto
+        // the default skin's paths, then material instances are copied over the default
+        // ones (a skin MI that has the default MI as its parent gets that parent
+        // re-pointed at a `_Base` copy, otherwise it would be its own parent).
+        let weapons_on = std::env::var_os("RS_NO_WEAPONS").is_none()
+            && (std::env::var_os("RS_FORCE_WEAPONS").is_some()
+                || !WEAPON_SWAP_BLOCKLIST
+                    .iter()
+                    .any(|h| target_id.starts_with(h)));
+        if retexture.is_none() && weapons_on {
             if let (Some(src_cannons), Some(dst_cannons)) =
                 (index.cannons.get(mesh_skin), index.cannons.get(target_id))
             {
+                // Debug: skip meshes whose material count differs from the default's.
+                let strict_layout = std::env::var_os("RS_STRICT_LAYOUT").is_some();
                 for (dir, package) in src_cannons {
                     let Some((_, target)) = dst_cannons.iter().find(|(d, _)| d == dir) else {
                         continue;
                     };
                     let name = package.rsplit('/').next().unwrap_or(package);
-log(format!("Extracting {name}..."));
-let cannon = game.extract_package(package, &work_dir.join("extract"))?;
-let stock = game.extract_package(target, &work_dir.join("extract_default"))?;
-let (a, b) = (mi_count(&names(&cannon)?), mi_count(&names(&stock)?));
-let allow_layout = std::env::var("RS_ALLOW_MISMATCH").is_ok_and(|v| {
-    let v = v.to_ascii_lowercase();
-    v == "1" || v.split(',').any(|s| !s.is_empty() && package.to_ascii_lowercase().contains(s))
-});
-if !allow_layout && a != b {
-    log(format!("  Skipped {name}: material layout differs from the default weapon (skin {a} vs default {b})"));
-    continue;
-}
-stage(&cannon, &content_dir, target)?;
-let dst = content_dir.join(target.trim_start_matches("/Game/"));
-let old = relocate_package(&dst.with_extension("uasset"), target, &HashMap::new())?;
-log(format!("  Cannon: {old} -> {target}"));
+                    log(format!("Extracting {name}..."));
+                    let cannon = game.extract_package(package, &work_dir.join("extract"))?;
+                    if strict_layout {
+                        let stock =
+                            game.extract_package(target, &work_dir.join("extract_default"))?;
+                        let (a, b) = (mi_count(&names(&cannon)?), mi_count(&names(&stock)?));
+                        if a != b {
+                            log(format!(
+                                "  Skipped {name}: material layout differs from the default weapon (skin {a} vs default {b})"
+                            ));
+                            continue;
+                        }
                     }
+                    stage(&cannon, &content_dir, target)?;
+                    let dst = content_dir.join(target.trim_start_matches("/Game/"));
+                    let old =
+                        relocate_package(&dst.with_extension("uasset"), target, &HashMap::new())?;
+                    log(format!("  Cannon: {old} -> {target}"));
                 }
             }
-        
-if std::env::var_os("RS_MOVE_MI").is_some() {
-    let skip_mi: Vec<String> = std::env::var("RS_SKIP_MI").unwrap_or_default()
-        .to_ascii_lowercase().split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
-    for (src_map, dst_map) in [
-        (index.weapon_mats.get(source_id), index.weapon_mats.get(target_id)),
-        (index.weapon_mats_lobby.get(source_id), index.weapon_mats_lobby.get(target_id)),
-    ] {
-        let (Some(src), Some(dst)) = (src_map, dst_map) else { continue };
-        let mut used: std::collections::HashSet<&String> = Default::default();
-        let mut slots: Vec<&String> = src.keys().collect();
-        slots.sort();
-let dst_lower: std::collections::HashSet<String> = dst.values().map(|p| p.to_ascii_lowercase()).collect();
-let mut made: std::collections::HashSet<String> = Default::default();
-        for slot in slots {
-            let src_pkg = &src[slot];
-            let dst_pkg = match dst.get(slot) {
-                Some(p) => p,
-                None => {
-                    let k = mi_key(slot);
-                    let c: Vec<&String> = dst.iter().filter(|(s, _)| mi_key(s) == k).map(|(_, p)| p).collect();
-                    if c.len() != 1 { continue; }
-                    c[0]
+        }
+
+        // Weapon material instances: the skin's MI replaces the default skin's MI that
+        // the game applies to the weapon (paired by name, then by weapon folder).
+        if weapons_on {
+            // Debug: comma-separated substrings of default MI paths to leave alone.
+            let skip_mi: Vec<String> = std::env::var("RS_SKIP_MI")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            for (src_map, dst_map) in [
+                (
+                    index.weapon_mats.get(source_id),
+                    index.weapon_mats.get(target_id),
+                ),
+                (
+                    index.weapon_mats_lobby.get(source_id),
+                    index.weapon_mats_lobby.get(target_id),
+                ),
+            ] {
+                let (Some(src), Some(dst)) = (src_map, dst_map) else {
+                    continue;
+                };
+                let dst_lower: std::collections::HashSet<String> =
+                    dst.values().map(|p| p.to_ascii_lowercase()).collect();
+                let mut used: std::collections::HashSet<&String> = Default::default();
+                let mut made: std::collections::HashSet<String> = Default::default();
+                let mut slots: Vec<&String> = src.keys().collect();
+                slots.sort();
+                for slot in slots {
+                    let src_pkg = &src[slot];
+                    let dst_pkg = match dst.get(slot) {
+                        Some(p) => p,
+                        None => {
+                            let k = mi_key(slot);
+                            let mut c: Vec<&String> = dst
+                                .iter()
+                                .filter(|(s, _)| mi_key(s) == k)
+                                .map(|(_, p)| p)
+                                .collect();
+                            if c.len() != 1 {
+                                // Same weapon folder, default MI named after the folder.
+                                let wd = weapon_dir(src_pkg);
+                                c = dst
+                                    .iter()
+                                    .filter(|(s, p)| {
+                                        !wd.is_empty()
+                                            && weapon_dir(p) == wd
+                                            && s.to_ascii_lowercase().contains(wd.as_str())
+                                    })
+                                    .map(|(_, p)| p)
+                                    .collect();
+                            }
+                            if c.len() != 1 {
+                                continue;
+                            }
+                            c[0]
+                        }
+                    };
+                    if skip_mi
+                        .iter()
+                        .any(|s| dst_pkg.to_ascii_lowercase().contains(s.as_str()))
+                    {
+                        continue;
+                    }
+                    if !used.insert(dst_pkg) {
+                        continue;
+                    }
+                    let mi = game.extract_package(src_pkg, &work_dir.join("extract"))?;
+                    // Skin MIs often have the default MI as their parent: copy the default
+                    // MI to `<name>_Base` and point the skin MI at it.
+                    let nm = names(&mi)?;
+                    let parents: Vec<&String> = nm
+                        .iter()
+                        .filter(|n| dst_lower.contains(&n.to_ascii_lowercase()))
+                        .collect();
+                    let mut renames: HashMap<String, String> = HashMap::new();
+                    for par in parents {
+                        let Some(def_pkg) = dst.values().find(|p| p.eq_ignore_ascii_case(par))
+                        else {
+                            continue;
+                        };
+                        let base_pkg = format!("{def_pkg}_Base");
+                        if made.insert(base_pkg.clone()) {
+                            let def =
+                                game.extract_package(def_pkg, &work_dir.join("extract_default"))?;
+                            stage(&def, &content_dir, &base_pkg)?;
+                            let bp = content_dir
+                                .join(base_pkg.trim_start_matches("/Game/"))
+                                .with_extension("uasset");
+                            relocate_package(&bp, &base_pkg, &HashMap::new())?;
+                            log(format!("  Weapon MI base: {def_pkg} -> {base_pkg}"));
+                        }
+                        let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+                        renames.insert(par.clone(), base_pkg.clone());
+                        renames.insert(short(par.as_str()), short(base_pkg.as_str()));
+                    }
+                    stage(&mi, &content_dir, dst_pkg)?;
+                    let p = content_dir
+                        .join(dst_pkg.trim_start_matches("/Game/"))
+                        .with_extension("uasset");
+                    let old = relocate_package(&p, dst_pkg, &renames)?;
+                    log(format!("  Weapon MI: {old} -> {dst_pkg}"));
                 }
+            }
+        }
+
+        // Weapons the skin only recolors: the default weapon mesh with the skin's materials.
+        if let Some(defaults) = index.cannons.get(target_id).filter(|_| weapons_on) {
+            let own = if retexture.is_none() {
+                index.cannons.get(mesh_skin)
+            } else {
+                None
             };
-            if skip_mi.iter().any(|s| dst_pkg.to_ascii_lowercase().contains(s.as_str())) { continue; }
-            if !used.insert(dst_pkg) { continue; }
-            let mi = game.extract_package(src_pkg, &work_dir.join("extract"))?;
-let nm = names(&mi)?;
-let parents: Vec<&String> = nm.iter().filter(|n| dst_lower.contains(&n.to_ascii_lowercase())).collect();
-let mut renames: HashMap<String, String> = HashMap::new();
-if !parents.is_empty() {
-    if std::env::var_os("RS_REPARENT").is_none() {
-        log(format!("  Weapon MI skipped (parent is the default MI): {src_pkg}"));
-        continue;
-    }
-    for par in parents {
-        let Some(def_pkg) = dst.values().find(|p| p.eq_ignore_ascii_case(par)) else { continue };
-        let base_pkg = format!("{def_pkg}_Base");
-        if made.insert(base_pkg.clone()) {
-            let def = game.extract_package(def_pkg, &work_dir.join("extract_default"))?;
-            stage(&def, &content_dir, &base_pkg)?;
-            let bp = content_dir.join(base_pkg.trim_start_matches("/Game/")).with_extension("uasset");
-            relocate_package(&bp, &base_pkg, &HashMap::new())?;
-            log(format!("  Weapon MI base: {def_pkg} -> {base_pkg}"));
+            for (key, target) in defaults {
+                if own.is_some_and(|o| o.iter().any(|(k, _)| k == key)) {
+                    continue;
+                }
+                let lobby = key.contains("_lobby");
+                let (first, second) = if lobby {
+                    (
+                        index.weapon_mats_lobby.get(source_id),
+                        index.weapon_mats.get(source_id),
+                    )
+                } else {
+                    (
+                        index.weapon_mats.get(source_id),
+                        index.weapon_mats_lobby.get(source_id),
+                    )
+                };
+                let Some(mats) = first.or(second) else {
+                    continue;
+                };
+                let name = target.rsplit('/').next().unwrap_or(target);
+                let mesh = game.extract_package(target, &work_dir.join("extract"))?;
+                let mesh_names = names(&mesh)?;
+                // Some default meshes import their materials from .../Lobby/.
+                let mut renames = material_renames(&mesh_names, mats, lobby);
+                if renames.is_empty() {
+                    renames = material_renames(&mesh_names, mats, !lobby);
+                }
+                if renames.is_empty() {
+                    log(format!("  Weapon materials: nothing matched for {name}"));
+                    continue;
+                }
+                stage(&mesh, &content_dir, target)?;
+                let dst = content_dir.join(target.trim_start_matches("/Game/"));
+                relocate_package(&dst.with_extension("uasset"), target, &renames)?;
+                log(format!(
+                    "  Weapon materials: {name} ({} applied)",
+                    renames.len() / 2
+                ));
+            }
         }
-        let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-renames.insert(par.clone(), base_pkg.clone());
-renames.insert(short(par.as_str()), short(base_pkg.as_str()));
-    }
-}            stage(&mi, &content_dir, dst_pkg)?;
-            let p = content_dir.join(dst_pkg.trim_start_matches("/Game/")).with_extension("uasset");
-            let old = relocate_package(&p, dst_pkg, &renames)?;
-            log(format!("  Weapon MI: {old} -> {dst_pkg}"));
-        }
-    }
-}
-
-log(format!("  [dbg] armas src={:?} dst={:?}",
-    index.cannons.get(mesh_skin).map(|l| l.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>()),
-    index.cannons.get(target_id).map(|l| l.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>())));
-// Weapons the skin only recolors: the default weapon mesh with the skin's materials.
-if let Some(defaults) = index.cannons.get(target_id) {
-    let own = if retexture.is_none() { index.cannons.get(mesh_skin) } else { None };
-    for (key, target) in defaults {
-        if own.is_some_and(|o| o.iter().any(|(k, _)| k == key)) {
-            continue;
-        }
-
-        let lobby = key.contains("_lobby");
-        let (first, second) = if lobby {
-            (index.weapon_mats_lobby.get(source_id), index.weapon_mats.get(source_id))
-        } else {
-            (index.weapon_mats.get(source_id), index.weapon_mats_lobby.get(source_id))
-        };
-        let Some(mats) = first.or(second) else { continue };
-        let name = target.rsplit('/').next().unwrap_or(target);
-        let mesh = game.extract_package(target, &work_dir.join("extract"))?;
-        let mesh_names = names(&mesh)?;
-        // Some default meshes import their materials from .../Lobby/.
-        let mut renames = material_renames(&mesh_names, mats, lobby);
-        if renames.is_empty() {
-            renames = material_renames(&mesh_names, mats, !lobby);
-        }
-        if renames.is_empty() {
-            log(format!("  Weapon materials: nothing matched for {name}"));
-            continue;
-        }
-        stage(&mesh, &content_dir, target)?;
-        let dst = content_dir.join(target.trim_start_matches("/Game/"));
-        relocate_package(&dst.with_extension("uasset"), target, &renames)?;
-        log(format!("  Weapon materials: {name} ({} applied)", renames.len() / 2));
-    }
-}        ensure!(
+        ensure!(
             !packed.is_empty(),
             "The default skin has no mesh for any of this skin's forms."
         );
@@ -359,14 +434,17 @@ if let Some(defaults) = index.cannons.get(target_id) {
             target_id,
             options,
         );
-                let overrides: Vec<_> = overrides
+        let overrides: Vec<_> = overrides
             .into_iter()
             .filter(|(p, _)| {
-                !content_dir.join(p.trim_start_matches("/Game/")).with_extension("uasset").exists()
+                !content_dir
+                    .join(p.trim_start_matches("/Game/"))
+                    .with_extension("uasset")
+                    .exists()
             })
             .filter(|(p, _)| !(p.contains("/Animations/Emotes/") && !p.contains("Lobby")))
             .collect();
-                for (package, renames) in &overrides {
+        for (package, renames) in &overrides {
             log(format!("    override: {package}"));
             let file = game.extract_package(package, &work_dir.join("extract"))?;
             let dst = stage(&file, &content_dir, package)?;
@@ -1181,17 +1259,37 @@ fn name_entries(raw: &[u8], pos: &HashMap<&str, usize>) -> Result<Vec<(String, u
     }
     Ok(out)
 }
+/// Heroes whose skin weapons are left as the default's. Deadpool (1057): the skin's
+/// katanas and pistols have more material slots than the default weapons and the
+/// materials can't be paired by name or folder, so the swapped weapons render with
+/// wrong textures. `RS_FORCE_WEAPONS=1` overrides this for testing.
+const WEAPON_SWAP_BLOCKLIST: &[&str] = &["1057"];
 
+fn weapon_dir(pkg: &str) -> String {
+    let l = pkg.to_ascii_lowercase();
+    l.split("/weapons/")
+        .nth(1)
+        .and_then(|r| r.split('/').next())
+        .unwrap_or("")
+        .to_string()
+}
 fn mi_key(slot: &str) -> String {
-    let mut s = slot.to_ascii_lowercase().replace('_', "").replace("weapon", "");
-    while s.ends_with(|c: char| c.is_ascii_digit()) { s.pop(); }
+    let mut s = slot
+        .to_ascii_lowercase()
+        .replace('_', "")
+        .replace("weapon", "");
+    while s.ends_with(|c: char| c.is_ascii_digit()) {
+        s.pop();
+    }
     s
 }
 
 fn mi_count(names: &[String]) -> usize {
     names
         .iter()
-        .filter(|n| n.starts_with('/') && n.rsplit('/').next().is_some_and(|o| o.starts_with("MI_")))
+        .filter(|n| {
+            n.starts_with('/') && n.rsplit('/').next().is_some_and(|o| o.starts_with("MI_"))
+        })
         .count()
 }
 /// The package's name map.
