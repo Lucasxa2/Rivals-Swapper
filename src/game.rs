@@ -26,6 +26,8 @@ pub struct Game {
     paks_dir: PathBuf,
     store: Store,
     skins: OnceLock<SkinIndex>,
+    /// How many RS_OVERLAY containers sit at the front of the store.
+    overlay: usize,
 }
 
 /// What the game files hold per skin id.
@@ -61,6 +63,9 @@ pub struct SkinIndex {
     pub weapon_mats: HashMap<String, HashMap<String, String>>,
     /// Same, for materials in Lobby folders.
     pub weapon_mats_lobby: HashMap<String, HashMap<String, String>>,
+    /// Materials in first-person weapon folders (".../Weapons/<dir>_1P/..."), which reuse the
+    /// third-person MI names: lowercased package -> package.
+    pub weapon_mats_1p: HashMap<String, HashMap<String, String>>,
 }
 
 impl Game {
@@ -93,11 +98,41 @@ impl Game {
         store.containers.sort_by(|a, b| {
             container_priority(b.container_name()).cmp(&container_priority(a.container_name()))
         });
+        // Extra containers that win over the game's (RS_OVERLAY: .utoc files, ';'-separated),
+        // e.g. a mod installed on top of a skin: the swap then carries the mod's version of
+        // the skin's packages instead of the original ones.
+        let mut overlay = 0;
+        if let Some(list) = std::env::var_os("RS_OVERLAY") {
+            let mut front = 0;
+            for path in std::env::split_paths(&list) {
+                match iostore::open(&path, config.clone()) {
+                    Ok(c) => {
+                        store.containers.insert(front, c);
+                        front += 1;
+                    }
+                    Err(e) => eprintln!("[game] overlay {}: {e:#}", path.display()),
+                }
+            }
+            overlay = front;
+        }
         Ok(Self {
             paks_dir: paks_dir.to_path_buf(),
             store,
             skins: OnceLock::new(),
+            overlay,
         })
+    }
+
+    /// Whether an RS_OVERLAY mod container supplies this package (for the log).
+    pub fn from_overlay(&self, package: &str) -> bool {
+        let chunk = bundle_chunk(package_id(package));
+        self.store.containers[..self.overlay]
+            .iter()
+            .any(|c| c.chunk_path(chunk).is_some())
+    }
+
+    pub fn overlay_count(&self) -> usize {
+        self.overlay
     }
 
     /// Read a file from the classic .pak files, e.g. "Marvel/Content/Localization/Game/en/Game.locres".
@@ -256,6 +291,11 @@ let skip: Vec<String> = std::env::var("RS_SKIP_WEAPONS").unwrap_or_default()
 if let Some(m) = wmat_re.captures(&path) {
     let dirs = m[4].to_ascii_lowercase();
     if m[3] == m[5] && !["mvp", "emote", "hovertofull"].iter().any(|w| dirs.contains(*w)) {
+        if dirs.contains("_1p/") {
+            let pkg = format!("/Game/{}", &m[1]);
+            index.weapon_mats_1p.entry(m[3].to_string()).or_default()
+                .insert(pkg.to_ascii_lowercase(), pkg);
+        }
         let map = if dirs.contains("lobby") { &mut index.weapon_mats_lobby } else { &mut index.weapon_mats };
         map.entry(m[3].to_string()).or_default()
             .entry(m[6].to_string())
@@ -449,8 +489,9 @@ impl IoStoreTrait for Store {
         "VIRTUAL"
     }
     fn container_file_version(&self) -> Option<EIoStoreTocVersion> {
+        // The game's own containers (an RS_OVERLAY mod sits in front).
         self.containers
-            .first()
+            .last()
             .and_then(|c| c.container_file_version())
     }
     fn container_header_version(&self) -> Option<EIoContainerHeaderVersion> {
