@@ -57,6 +57,9 @@ pub fn create(
 
     let _ = std::fs::remove_dir_all(work_dir);
     let result = (|| {
+        if game.overlay_count() > 0 {
+            log(format!("  Overlay: {} mod container(s) loaded", game.overlay_count()));
+        }
         let index = game.skins();
         let retexture = if index.meshes.contains_key(source_id) {
             None
@@ -110,12 +113,13 @@ pub fn create(
                     }
                     _ => {
                         log(format!(
-                            "Extracting {mesh_name}{}...",
+                            "Extracting {mesh_name}{}{}...",
                             if *form > 0 {
                                 format!(" (form {form})")
                             } else {
                                 String::new()
-                            }
+                            },
+                            if game.from_overlay(package) { " [mod]" } else { "" }
                         ));
                         let mesh = game.extract_package(package, &work_dir.join("extract"))?;
                         let renames = match &retexture {
@@ -180,18 +184,28 @@ pub fn create(
                 || !WEAPON_SWAP_BLOCKLIST
                     .iter()
                     .any(|h| target_id.starts_with(h)));
+        // First-person meshes already replaced by the skin's mesh (unless RS_NO_MESH_1P): the
+        // recolor pass below must not put the default mesh back.
+        let mut mirrored_1p: std::collections::HashSet<String> = Default::default();
+        // Weapons whose skin mesh lists its material slots in another order than the
+        // default's (unless RS_NO_SLOT_ORDER): "<weapon dir>[/lobby]/<skin slot>" -> default slot.
+        // The game fills the default mesh's slots by position, so the skin's MIs have
+        // to go where their slot sits on the default mesh, not where their name says.
+        let mut slot_map: HashMap<String, String> = HashMap::new();
         if retexture.is_none() && weapons_on {
             if let (Some(src_cannons), Some(dst_cannons)) =
                 (index.cannons.get(mesh_skin), index.cannons.get(target_id))
             {
                 // Debug: skip meshes whose material count differs from the default's.
                 let strict_layout = std::env::var_os("RS_STRICT_LAYOUT").is_some();
+                let mesh_1p = std::env::var_os("RS_NO_MESH_1P").is_none();
+                let slot_order = std::env::var_os("RS_NO_SLOT_ORDER").is_none();
                 for (dir, package) in src_cannons {
                     let Some((_, target)) = dst_cannons.iter().find(|(d, _)| d == dir) else {
                         continue;
                     };
                     let name = package.rsplit('/').next().unwrap_or(package);
-                    log(format!("Extracting {name}..."));
+                    log(format!("Extracting {name}{}...", if game.from_overlay(package) { " [mod]" } else { "" }));
                     let cannon = game.extract_package(package, &work_dir.join("extract"))?;
                     if strict_layout {
                         let stock =
@@ -209,6 +223,60 @@ pub fn create(
                     let old =
                         relocate_package(&dst.with_extension("uasset"), target, &HashMap::new())?;
                     log(format!("  Cannon: {old} -> {target}"));
+
+                    // (RS_NO_SLOT_ORDER turns it off): compare the two meshes' material slot
+                    // order; when it differs, pair the MIs by position.
+                    if slot_order {
+                        let stock =
+                            game.extract_package(target, &work_dir.join("extract_default"))?;
+                        let ((sa, how), (sb, _)) = (mi_slots(&cannon)?, mi_slots(&stock)?);
+                        log(format!("  Slots {name} ({how}): skin {sa:?} / default {sb:?}"));
+                        if how == "imports" && std::env::var_os("RS_SLOT_DEBUG").is_some() {
+                            log(format!("  Slots debug: {}", slot_debug(&cannon)));
+                        }
+                        if sa.len() >= 2 && sa.len() == sb.len() && sa != sb {
+                            let lobby = if dir.contains("_lobby") { "/lobby" } else { "" };
+                            let wd = format!("{}{lobby}", weapon_dir(package));
+                            for (s, d) in sa.iter().zip(&sb) {
+                                slot_map.insert(format!("{wd}/{s}"), d.clone());
+                            }
+                            log("  Slot order differs: pairing by position".into());
+                        }
+                    }
+
+                    // (RS_NO_MESH_1P turns it off): the skin ships no first-person mesh of its
+                    // own (e.g. Punisher's Turret_1P), but the game shows the skin's main
+                    // mesh there. Put it on the default's single `<dir>_1P` mesh as well,
+                    // bound to that mesh's skeleton.
+                    if mesh_1p {
+                        let d1 = format!("{}_1p", dir.split('/').next().unwrap_or(""));
+                        let in_dir = |k: &String| k.split('/').next() == Some(d1.as_str());
+                        let has_own = src_cannons.iter().any(|(k, _)| in_dir(k));
+                        let twins: Vec<&String> = dst_cannons
+                            .iter()
+                            .filter(|(k, _)| !k.contains("_lobby") && in_dir(k))
+                            .map(|(_, p)| p)
+                            .collect();
+                        if let ([t1], false) = (twins.as_slice(), has_own) {
+                            let t1: &str = t1.as_str();
+                            let skel = format!("{t1}_Skeleton");
+                            let short = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
+                            let mut renames: HashMap<String, String> = HashMap::new();
+                            for n in names(&cannon)? {
+                                if n.ends_with("_Skeleton") && n.contains("/Meshes/") {
+                                    renames.insert(short(&n), short(&skel));
+                                    renames.insert(n, skel.clone());
+                                }
+                            }
+                            stage(&cannon, &content_dir, t1)?;
+                            let p = content_dir
+                                .join(t1.trim_start_matches("/Game/"))
+                                .with_extension("uasset");
+                            let old = relocate_package(&p, t1, &renames)?;
+                            log(format!("  Cannon (1P): {old} -> {t1}"));
+                            mirrored_1p.insert(t1.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -245,7 +313,17 @@ pub fn create(
                 slots.sort();
                 for slot in slots {
                     let src_pkg = &src[slot];
-                    let dst_pkg = match dst.get(slot) {
+                    let by_position = {
+                        let lobby = if src_pkg.to_ascii_lowercase().contains("/lobby/") {
+                            "/lobby"
+                        } else {
+                            ""
+                        };
+                        slot_map
+                            .get(&format!("{}{lobby}/{slot}", weapon_dir(src_pkg)))
+                            .and_then(|d| dst.get(d))
+                    };
+                    let dst_pkg = match by_position.or_else(|| dst.get(slot)) {
                         Some(p) => p,
                         None => {
                             let k = mi_key(slot);
@@ -317,6 +395,28 @@ pub fn create(
                         .with_extension("uasset");
                     let old = relocate_package(&p, dst_pkg, &renames)?;
                     log(format!("  Weapon MI: {old} -> {dst_pkg}"));
+
+                    // The first-person twin (".../Weapons/<dir>_1P/...", same MI name) is what
+                    // the game shows once you take control of the weapon: give it the skin's
+                    // MI too. `RS_SKIP_MI=_1p` leaves these alone.
+                    if let Some(p1) = index
+                        .weapon_mats_1p
+                        .get(target_id)
+                        .zip(first_person_key(dst_pkg))
+                        .and_then(|(m, k)| m.get(&k))
+                    {
+                        if !skip_mi
+                            .iter()
+                            .any(|s| p1.to_ascii_lowercase().contains(s.as_str()))
+                        {
+                            stage(&mi, &content_dir, p1)?;
+                            let p = content_dir
+                                .join(p1.trim_start_matches("/Game/"))
+                                .with_extension("uasset");
+                            let old = relocate_package(&p, p1, &renames)?;
+                            log(format!("  Weapon MI (1P): {old} -> {p1}"));
+                        }
+                    }
                 }
             }
         }
@@ -329,7 +429,9 @@ pub fn create(
                 None
             };
             for (key, target) in defaults {
-                if own.is_some_and(|o| o.iter().any(|(k, _)| k == key)) {
+                if own.is_some_and(|o| o.iter().any(|(k, _)| k == key))
+                    || mirrored_1p.contains(target)
+                {
                     continue;
                 }
                 let lobby = key.contains("_lobby");
@@ -424,6 +526,277 @@ pub fn create(
             log(format!("  Effects: {} ability cues", cues.len()));
         }
 
+        // Experimental (RS_UPGRADED_FX): cues that subclass the default skin's cue are normally
+        // left out (moved onto the default's path they would be their own parent). Here the
+        // default cue is copied to `<name>_Base` and the skin's cue re-pointed at it. Covers
+        // the skin's regular cues that inherit, and the unlockable ("upgraded") effects in
+        // Slots/UpgradedSkinFX/39<skin>/, whose cues share their names with the default's;
+        // those go last so they win. The Niagara systems they use stay in the game files.
+        if options.effects && std::env::var_os("RS_UPGRADED_FX").is_some() {
+            let fx_skin = retexture.as_ref().map_or(source_id, |r| &r.base_skin);
+            if fx_skin != target_id {
+                let mut cue_bases: HashSet<String> = HashSet::new();
+                let mut done = 0;
+                let ns_swap = std::env::var_os("RS_NS_SWAP").is_some();
+                // A skin cue that drops a default system without bringing a new one in (the
+                // death cue keeps the dissolve but sets its colours) can only be reproduced as a
+                // subclass; the others are better served by the Niagara name swap below.
+                let needs_subclass = |pkg: &str| -> bool {
+                    let h = &target_id[..4];
+                    let up = format!(
+                        "/Game/Marvel/Characters/{h}/{fx_skin}/Slots/UpgradedSkinFX/39{fx_skin}/"
+                    );
+                    let vfx = format!("/Game/Marvel/VFX/Particles/Characters/{h}/{target_id}/");
+                    let ns = |p: &str, prefix: &str| -> HashSet<String> {
+                        let Ok(file) = game.extract_package(p, &work_dir.join("scan")) else {
+                            return HashSet::new();
+                        };
+                        names(&file)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|n| n.starts_with(prefix))
+                            .filter(|n| n.rsplit('/').next().is_some_and(|f| f.starts_with("NS_")))
+                            .map(|n| n[prefix.len()..].to_ascii_lowercase())
+                            .collect()
+                    };
+                    let file = pkg.rsplit('/').next().unwrap_or(pkg);
+                    let s = ns(pkg, &up);
+                    index
+                        .cues
+                        .get(target_id.as_str())
+                        .into_iter()
+                        .flatten()
+                        .filter(|(rel, _)| {
+                            rel.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case(file))
+                        })
+                        .any(|(_, d)| {
+                            let dn = ns(d, &vfx);
+                            dn.iter().any(|r| !s.contains(r)) && s.iter().all(|r| dn.contains(r))
+                        })
+                };
+                for (package, target) in
+                    inheriting_cues(game, &work_dir.join("cues"), fx_skin, target_id)
+                        .into_iter()
+                        .filter(|_| !ns_swap)
+                {
+                    place_cue(game, work_dir, &content_dir, &package, &target, &mut cue_bases)?;
+                    log(format!("  Inheriting cue: {package} -> {target}"));
+                    done += 1;
+                }
+                let hero = &target_id[..4];
+                let from = format!(
+                    "/Game/Marvel/Characters/{hero}/{fx_skin}/Slots/UpgradedSkinFX/39{fx_skin}/"
+                );
+                let mut by_name: HashMap<String, Vec<&String>> = HashMap::new();
+                for (rel, pkg) in index.cues.get(target_id).into_iter().flatten() {
+                    let file = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
+                    by_name.entry(file).or_default().push(pkg);
+                }
+                let mut fx = game.packages_under(&from);
+                fx.sort();
+                let mut upgraded = 0;
+                for package in &fx {
+                    let file_name = package.rsplit('/').next().unwrap_or(package);
+                    if !file_name.starts_with("Cue_") {
+                        continue;
+                    }
+                    // With RS_NS_SWAP only the cues a name swap can't reproduce are placed as
+                    // subclasses; the rest are handled by the swap below.
+                    if ns_swap && !needs_subclass(package) {
+                        log(format!("  Upgraded FX: {file_name} left to the NS swap"));
+                        continue;
+                    }
+                    let Some(targets) = by_name.get(&file_name.to_ascii_lowercase()) else {
+                        log(format!("  Upgraded FX: no default cue named {file_name}"));
+                        continue;
+                    };
+                    for target in targets {
+                        let inherits =
+                            place_cue(game, work_dir, &content_dir, package, target, &mut cue_bases)?;
+                        log(format!(
+                            "  Upgraded FX: {file_name} -> {target}{}",
+                            if inherits { " (re-parented)" } else { "" }
+                        ));
+                        upgraded += 1;
+                    }
+                }
+                log(format!(
+                    "  Cue extras: {done} inheriting cue(s), {upgraded} upgraded cue(s) ({} packages in 39{fx_skin})",
+                    fx.len()
+                ));
+                // Also the whole folder under the default's own id, in case the game builds
+                // these paths from the equipped skin id.
+                let to = format!(
+                    "/Game/Marvel/Characters/{hero}/{target_id}/Slots/UpgradedSkinFX/39{target_id}/"
+                );
+                for package in &fx {
+                    let target = format!("{to}{}", &package[from.len()..]);
+                    let file = game.extract_package(package, &work_dir.join("extract"))?;
+                    let dst = stage(&file, &content_dir, &target)?;
+                    relocate_package(&dst, &target, &HashMap::new())?;
+                }
+                log(format!("  Upgraded FX folder: {} packages copied to 39{target_id}", fx.len()));
+            }
+        }
+
+        // Experimental (RS_SKIN_CUSTOM): a skin's customization cues
+        // (Slots/SkinCustomizations/45<skin>/Cue_Hero_Skin_Customization_<skin>[_Lobby]) carry
+        // the tag GameplayCue.HeroSkinCustomization.45<skin>0000, which the game looks up with
+        // the equipped skin's id. The default skin has none: copy them to the default's id
+        // and rename the tag to match.
+        if options.effects && std::env::var_os("RS_SKIN_CUSTOM").is_some() {
+            let fx_skin = retexture.as_ref().map_or(source_id, |r| &r.base_skin);
+            if fx_skin != target_id {
+                let hero = &target_id[..4];
+                let from = format!(
+                    "/Game/Marvel/Characters/{hero}/{fx_skin}/Slots/SkinCustomizations/45{fx_skin}/"
+                );
+                let to = format!(
+                    "/Game/Marvel/Characters/{hero}/{target_id}/Slots/SkinCustomizations/45{target_id}/"
+                );
+                let (tag_old, tag_new) = (format!("45{fx_skin}"), format!("45{target_id}"));
+                let mut pk = game.packages_under(&from);
+                pk.sort();
+                for package in &pk {
+                    let rest = package[from.len()..].replace(fx_skin.as_str(), target_id.as_str());
+                    let target = format!("{to}{rest}");
+                    let file = game.extract_package(package, &work_dir.join("extract"))?;
+                    let renames: HashMap<String, String> = names(&file)?
+                        .into_iter()
+                        .filter(|n| {
+                            n.starts_with("GameplayCue.HeroSkinCustomization.") && n.contains(&tag_old)
+                        })
+                        .map(|n| {
+                            let new = n.replace(&tag_old, &tag_new);
+                            (n, new)
+                        })
+                        .collect();
+                    let dst = stage(&file, &content_dir, &target)?;
+                    relocate_package(&dst, &target, &renames)?;
+                    log(format!(
+                        "  Skin customization: {package} -> {target} ({} tag name(s) renamed)",
+                        renames.len()
+                    ));
+                }
+            }
+        }
+
+        // Diagnostic (RS_FX_SCAN): which assets of the hero mention the upgraded-FX folders.
+        if std::env::var_os("RS_FX_SCAN").is_some() {
+            use rayon::prelude::*;
+            let fx_skin = retexture.as_ref().map_or(source_id, |r| &r.base_skin);
+            let hero = &target_id[..4];
+            let own = format!("/Game/Marvel/Characters/{hero}/{fx_skin}/Slots/SkinCustomizations/");
+            for p in game.packages_under(&own) {
+                log(format!("  FX scan: skin customization asset {p}"));
+            }
+            let prefix = format!("/Game/Marvel/Characters/{hero}/");
+            let mut hits: Vec<(String, String)> = game
+                .packages_under(&prefix)
+                .par_iter()
+                .filter(|p| !p.contains("/Slots/UpgradedSkinFX/"))
+                .filter(|p| {
+                    let seg = p[prefix.len()..].split('/').next().unwrap_or("");
+                    seg == target_id
+                        || seg == fx_skin
+                        || !(seg.len() == 7 && seg.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .filter_map(|p| {
+                    let n = game.header_names(p).ok()?;
+                    let h = n.into_iter().find(|n| {
+                        let l = n.to_ascii_lowercase();
+                        l.contains("upgradedskin") || l.contains("skincustomization")
+                    })?;
+                    Some((p.clone(), h))
+                })
+                .collect();
+            hits.sort();
+            log(format!("  FX scan: {} package(s) mention upgraded FX", hits.len()));
+            for (p, h) in hits.iter().take(40) {
+                log(format!("  FX scan: {p} -> {h}"));
+            }
+
+            for (label, m) in [
+                (fx_skin.as_str(), index.cues.get(fx_skin.as_str())),
+                (target_id.as_str(), index.cues.get(target_id.as_str())),
+            ] {
+                let mut v: Vec<&String> = m.into_iter().flat_map(|m| m.keys()).collect();
+                v.sort();
+                log(format!("  FX scan: {label} has {} cue(s) under Cues/", v.len()));
+                for k in v.iter().take(80) {
+                    log(format!("  FX scan cue {label}: {k}"));
+                }
+            }
+
+            // Niagara systems named by each upgraded cue and by the default cue it replaces.
+            {
+                let mut by_name: HashMap<String, Vec<&String>> = HashMap::new();
+                for (rel, pkg) in index.cues.get(target_id.as_str()).into_iter().flatten() {
+                    let f = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
+                    by_name.entry(f).or_default().push(pkg);
+                }
+                let from = format!(
+                    "/Game/Marvel/Characters/{hero}/{fx_skin}/Slots/UpgradedSkinFX/39{fx_skin}/"
+                );
+                let ns_names = |pkg: &str| -> Vec<String> {
+                    let Ok(file) = game.extract_package(pkg, &work_dir.join("scan")) else {
+                        return vec![];
+                    };
+                    let mut v: Vec<String> = names(&file)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|n| n.contains("/NS_") || n.contains("/Particles/"))
+                        .collect();
+                    v.sort();
+                    v
+                };
+                let mut fx = game.packages_under(&from);
+                fx.sort();
+                for package in fx.iter().filter(|p| p.rsplit('/').next().is_some_and(|f| f.starts_with("Cue_"))) {
+                    let file_name = package.rsplit('/').next().unwrap_or(package);
+                    log(format!("  FX scan cue {file_name}:"));
+                    for n in ns_names(package).iter().take(14) {
+                        log(format!("      skin    uses {n}"));
+                    }
+                    for def in by_name.get(&file_name.to_ascii_lowercase()).into_iter().flatten() {
+                        log(format!("      default {def}"));
+                        for n in ns_names(def).iter().take(14) {
+                            log(format!("      default uses {n}"));
+                        }
+                    }
+                }
+            }
+
+            // Hero-level packages (outside every skin folder) that name this skin's own folder:
+            // the places that could hold a per-skin effect map the animation overrides miss.
+            let own_dir = format!("/{fx_skin}/");
+            let scanned: Vec<String> = game
+                .packages_under(&prefix)
+                .into_iter()
+                .filter(|p| {
+                    let seg = p[prefix.len()..].split('/').next().unwrap_or("");
+                    !(seg.len() == 7 && seg.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .collect();
+            let mut refs: Vec<(String, String)> = scanned
+                .par_iter()
+                .filter_map(|p| {
+                    let n = game.header_names(p).ok()?;
+                    let h = n.into_iter().find(|n| n.contains(&own_dir))?;
+                    Some((p.clone(), h))
+                })
+                .collect();
+            refs.sort();
+            log(format!(
+                "  FX scan: {} of {} hero-level package(s) name {fx_skin}'s folder",
+                refs.len(),
+                scanned.len()
+            ));
+            for (p, h) in refs.iter().take(60) {
+                log(format!("  FX scan ref: {p} -> {h}"));
+            }
+        }
+
         // Default-skin animations name per-skin overrides (effects, sounds and
         // materials in anim notifies): the default entry takes the skin's asset.
         let override_skin = retexture.as_ref().map_or(source_id, |r| &r.base_skin);
@@ -455,6 +828,333 @@ pub fn create(
                 "  Animation overrides: {} packages",
                 overrides.len()
             ));
+        }
+
+        // Experimental (RS_NS_SWAP): the default skin's cues and animations name its Niagara
+        // systems and other effect assets (VFX/Particles/Characters/<hero>/<default>/<rel>).
+        // The skin ships assets with the same relative path either in its unlockable effects
+        // (Slots/UpgradedSkinFX/39<skin>/<rel>, Niagara only) or in its own effects folder
+        // (VFX/Particles/Characters/<hero>/<skin>/<rel>). Point the default packages at the
+        // skin's assets (same name-table swap the animation overrides use). Runs after the
+        // overrides, on top of any package they already staged.
+        if options.effects && std::env::var_os("RS_NS_SWAP").is_some() {
+            use rayon::prelude::*;
+            let fx_skin = retexture.as_ref().map_or(source_id, |r| &r.base_skin);
+            if fx_skin != target_id {
+                let hero = &target_id[..4];
+                let up = format!(
+                    "/Game/Marvel/Characters/{hero}/{fx_skin}/Slots/UpgradedSkinFX/39{fx_skin}/"
+                );
+                let vfx = format!("/Game/Marvel/VFX/Particles/Characters/{hero}/{target_id}/");
+                let own_vfx = format!("/Game/Marvel/VFX/Particles/Characters/{hero}/{fx_skin}/");
+                let mut swaps: HashMap<String, String> = game
+                    .packages_under(&up)
+                    .into_iter()
+                    .filter(|p| p.rsplit('/').next().is_some_and(|f| f.starts_with("NS_")))
+                    .map(|p| (p[up.len()..].to_ascii_lowercase(), p))
+                    .collect();
+                let upgraded = swaps.len();
+                for p in game.packages_under(&own_vfx) {
+                    swaps.entry(p[own_vfx.len()..].to_ascii_lowercase()).or_insert(p);
+                }
+                // Cues whose skin version uses differently named systems than the default
+                // one (Trajectory_01 for Trajectory_03): when the same number is left over on
+                // each side, pair them in order.
+                let mut extra: HashMap<String, HashMap<String, String>> = HashMap::new();
+                {
+                    let mut by_name: HashMap<String, Vec<&String>> = HashMap::new();
+                    for (rel, pkg) in index.cues.get(target_id.as_str()).into_iter().flatten() {
+                        let f = rel.rsplit('/').next().unwrap_or(rel).to_ascii_lowercase();
+                        by_name.entry(f).or_default().push(pkg);
+                    }
+                    let ns_of = |pkg: &str, prefix: &str| -> Vec<String> {
+                        let Ok(file) = game.extract_package(pkg, &work_dir.join("scan")) else {
+                            return vec![];
+                        };
+                        let mut v: Vec<String> = names(&file)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|n| n.starts_with(prefix))
+                            .filter(|n| n.rsplit('/').next().is_some_and(|f| f.starts_with("NS_")))
+                            .collect();
+                        v.sort();
+                        v.dedup();
+                        v
+                    };
+                    for package in game.packages_under(&up) {
+                        let file_name = package.rsplit('/').next().unwrap_or(&package).to_string();
+                        if !file_name.starts_with("Cue_") {
+                            continue;
+                        }
+                        let skin_ns = ns_of(&package, &up);
+                        for def in by_name.get(&file_name.to_ascii_lowercase()).into_iter().flatten() {
+                            let def_ns = ns_of(def, &vfx);
+                            let rel_s = |n: &str| n[up.len()..].to_ascii_lowercase();
+                            let rel_d = |n: &str| n[vfx.len()..].to_ascii_lowercase();
+                            let (s_set, d_set): (HashSet<String>, HashSet<String>) = (
+                                skin_ns.iter().map(|n| rel_s(n)).collect(),
+                                def_ns.iter().map(|n| rel_d(n)).collect(),
+                            );
+                            let s_only: Vec<&String> =
+                                skin_ns.iter().filter(|n| !d_set.contains(&rel_s(n))).collect();
+                            let d_only: Vec<&String> =
+                                def_ns.iter().filter(|n| !s_set.contains(&rel_d(n))).collect();
+                            if std::env::var_os("RS_NS_PAIR").is_some()
+                                && !s_only.is_empty()
+                                && s_only.len() == d_only.len()
+                                && s_only.len() <= 3
+                            {
+                                for (d, s) in d_only.iter().zip(&s_only) {
+                                    log(format!("  NS pair: {file_name}: {d} -> {s}"));
+                                    let m = extra.entry((*def).clone()).or_default();
+                                    m.insert((*d).clone(), (*s).clone());
+                                    // The import's object name is its own name-map entry
+                                    // ("NS_103851_Trajectory_03"): it has to name the skin's
+                                    // system too, or the asset loads as nothing.
+                                    let (dn, sn) = (
+                                        d.rsplit('/').next().unwrap_or(d.as_str()),
+                                        s.rsplit('/').next().unwrap_or(s.as_str()),
+                                    );
+                                    if dn != sn {
+                                        m.insert(dn.to_string(), sn.to_string());
+                                    }
+                                }
+                            } else if !d_only.is_empty() || !s_only.is_empty() {
+                                log(format!(
+                                    "  NS unpaired: {file_name}: default-only {d_only:?}, skin-only {s_only:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                let default_dir = format!("/Game/Marvel/Characters/{hero}/{target_id}/");
+                let mut candidates: Vec<String> = game
+                    .packages_under(&default_dir)
+                    .par_iter()
+                    .filter(|p| {
+                        game.header_names(p)
+                            .is_ok_and(|n| n.iter().any(|n| n.starts_with(&vfx)))
+                    })
+                    .cloned()
+                    .collect();
+                candidates.sort();
+                // Systems the skin names differently from the default one (Attack_02 in the
+                // default's second attack, Attack_07 in the skin's): pair what is left over on
+                // each side when exactly one candidate remains per group (RS_NS_PAIR).
+                // Tier 1: same folder and name apart from the trailing number (Attack_02 /
+                // Attack_07, Charge_02 / Charge_01). Tier 2 (RS_NS_PAIR2): same ability (first
+                // five digits of the folder) and name, for abilities the skin only ships under
+                // another folder (102941 Release_01 / 102942 Release_03).
+                if std::env::var_os("RS_NS_PAIR").is_some() {
+                    let leaf_of = |rel: &str| rel.rsplit('/').next().unwrap_or(rel).to_string();
+                    let stem1 = |rel: &str| -> (String, String) {
+                        let (dir, leaf) = rel.rsplit_once('/').unwrap_or(("", rel));
+                        (
+                            dir.to_string(),
+                            leaf.trim_end_matches(|c: char| c.is_ascii_digit()).to_string(),
+                        )
+                    };
+                    let stem2 = |rel: &str| -> (String, String) {
+                        let folder = rel.split('/').next().unwrap_or("");
+                        let leaf = leaf_of(rel);
+                        let leaf = leaf.strip_prefix("ns_").unwrap_or(&leaf);
+                        let leaf = leaf.trim_start_matches(|c: char| c.is_ascii_digit());
+                        (
+                            folder.chars().take(5).collect(),
+                            leaf.trim_end_matches(|c: char| c.is_ascii_digit()).to_string(),
+                        )
+                    };
+                    let mut matched: HashSet<String> = HashSet::new();
+                    let mut d_left: Vec<String> = vec![];
+                    for package in &candidates {
+                        let Ok(ns) = game.header_names(package) else {
+                            continue;
+                        };
+                        for n in ns.iter().filter(|n| n.starts_with(&vfx)) {
+                            let rel = n[vfx.len()..].to_ascii_lowercase();
+                            if !leaf_of(&rel).starts_with("ns_") {
+                                continue;
+                            }
+                            if swaps.contains_key(&rel) {
+                                matched.insert(rel);
+                            } else {
+                                d_left.push(rel);
+                            }
+                        }
+                    }
+                    d_left.sort();
+                    d_left.dedup();
+                    let skin_ns: Vec<String> = swaps
+                        .keys()
+                        .filter(|r| leaf_of(r).starts_with("ns_"))
+                        .cloned()
+                        .collect();
+                    let mut new_pairs: Vec<(String, String)> = vec![];
+                    let mut paired_d: HashSet<String> = HashSet::new();
+                    for tier in 1..=2 {
+                        if tier == 2 && std::env::var_os("RS_NS_PAIR2").is_none() {
+                            break;
+                        }
+                        let key = |r: &str| if tier == 1 { stem1(r) } else { stem2(r) };
+                        let mut ds: HashMap<(String, String), Vec<&String>> = HashMap::new();
+                        for d in d_left.iter().filter(|d| !paired_d.contains(*d)) {
+                            ds.entry(key(d)).or_default().push(d);
+                        }
+                        let mut ss: HashMap<(String, String), Vec<&String>> = HashMap::new();
+                        for s in skin_ns.iter().filter(|s| tier == 2 || !matched.contains(*s)) {
+                            ss.entry(key(s)).or_default().push(s);
+                        }
+                        let mut found: Vec<(String, String)> = vec![];
+                        for (k, d) in &ds {
+                            if let (1, Some(s)) = (d.len(), ss.get(k)) {
+                                if s.len() == 1 && d[0] != s[0] {
+                                    found.push((d[0].clone(), s[0].clone()));
+                                }
+                            }
+                        }
+                        found.sort();
+                        for (d, s) in found {
+                            log(format!("  NS pair (tier {tier}): {d} -> {s}"));
+                            paired_d.insert(d.clone());
+                            new_pairs.push((d, s));
+                        }
+                    }
+                    for (d, s) in new_pairs {
+                        if let Some(p) = swaps.get(&s).cloned() {
+                            swaps.insert(d, p);
+                        }
+                    }
+                }
+                let mut swapped = 0;
+                let scan_left = std::env::var_os("RS_FX_SCAN").is_some();
+                let mut used_rel: HashSet<String> = HashSet::new();
+                for package in &candidates {
+                    let staged = content_dir
+                        .join(package.trim_start_matches("/Game/"))
+                        .with_extension("uasset");
+                    let was_staged = staged.exists();
+                    let file = if was_staged {
+                        staged.clone()
+                    } else {
+                        game.extract_package(package, &work_dir.join("extract"))?
+                    };
+                    let all = names(&file)?;
+                    let mut renames: HashMap<String, String> = all
+                        .iter()
+                        .filter(|n| n.starts_with(&vfx))
+                        .filter_map(|n| {
+                            // A name the file already has (from an override) just ends up
+                            // listed twice, which the game accepts.
+                            let own = swaps.get(&n[vfx.len()..].to_ascii_lowercase())?;
+                            Some((n.clone(), own.clone()))
+                        })
+                        .collect();
+                    {
+                        // The object name of an import is its own name-map entry: when the skin's
+                        // system is called something else (Attack_07 for Attack_02), it has to be
+                        // renamed too or the asset loads as nothing.
+                        let shorts: Vec<(String, String)> = renames
+                            .iter()
+                            .filter_map(|(k, v)| {
+                                let (a, b) = (k.rsplit('/').next()?, v.rsplit('/').next()?);
+                                (a != b).then(|| (a.to_string(), b.to_string()))
+                            })
+                            .collect();
+                        renames.extend(shorts);
+                    }
+                    if scan_left {
+                        // Effects the default package names that stay the default's, and the
+                        // skin systems that did get used.
+                        let mut left: Vec<String> = all
+                            .iter()
+                            .filter(|n| n.starts_with(&vfx))
+                            .filter(|n| !swaps.contains_key(&n[vfx.len()..].to_ascii_lowercase()))
+                            .map(|n| n[vfx.len()..].to_string())
+                            .collect();
+                        left.sort();
+                        left.dedup();
+                        if !left.is_empty() {
+                            log(format!("  NS left default: {package}: {left:?}"));
+                        }
+                        for n in all.iter().filter(|n| n.starts_with(&vfx)) {
+                            let rel = n[vfx.len()..].to_ascii_lowercase();
+                            if swaps.contains_key(&rel) {
+                                used_rel.insert(rel);
+                            }
+                        }
+                    }
+                    if let Some(x) = extra.get(package) {
+                        renames.extend(x.iter().map(|(k, v)| (k.clone(), v.clone())));
+                    }
+                    if renames.is_empty() {
+                        continue;
+                    }
+                    let dst = if was_staged {
+                        staged
+                    } else {
+                        stage(&file, &content_dir, package)?
+                    };
+                    relocate_package(&dst, package, &renames)?;
+                    if extra.contains_key(package) {
+                        // The skin's cue sets IsEnemy to 0 on the swapped system (the default has
+                        // 1.0, which is what colours it as an enemy effect): EndPos (0,0,5000),
+                        // IsEnemy 1.0, Width 1.0  ->  IsEnemy 0.0.
+                        let n = patch_unique(
+                            &dst.with_extension("uexp"),
+                            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 156, 69, 0, 0, 128, 63, 0, 0, 128, 63],
+                            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 156, 69, 0, 0, 0, 0, 0, 0, 128, 63],
+                        )?;
+                        log(format!("  NS pair: IsEnemy patched in {package} ({n} match(es))"));
+                    }
+                    log(format!(
+                        "  NS swap: {package} ({} asset(s){})",
+                        renames.len(),
+                        if was_staged { ", on top of an override" } else { "" }
+                    ));
+                    swapped += 1;
+                }
+                // The pull's orb (Cue_Buff_Loop_10385107, NS_103811_Hit_01) has no skin version
+                // but the same IsEnemy = 1.0 constant (ParameterData of one float).
+                // Not applied by default: the skin has no version of this cue either, so the
+                // orb is probably the same in the real skin (RS_ORB_FIX forces IsEnemy = 0).
+                if std::env::var_os("RS_ORB_FIX").is_some() {
+                    for (rel, pkg) in index.cues.get(target_id.as_str()).into_iter().flatten() {
+                        if !rel.ends_with("Cue_Buff_Loop_10385107_BP") {
+                            continue;
+                        }
+                        let staged = content_dir
+                            .join(pkg.trim_start_matches("/Game/"))
+                            .with_extension("uasset");
+                        if !staged.exists() {
+                            let file = game.extract_package(pkg, &work_dir.join("extract"))?;
+                            let dst = stage(&file, &content_dir, pkg)?;
+                            relocate_package(&dst, pkg, &HashMap::new())?;
+                        }
+                        let n = patch_unique(
+                            &staged.with_extension("uexp"),
+                            &[4, 0, 0, 0, 0, 0, 128, 63],
+                            &[4, 0, 0, 0, 0, 0, 0, 0],
+                        )?;
+                        log(format!("  Orb: IsEnemy patched in {pkg} ({n} match(es))"));
+                    }
+                }
+                if scan_left {
+                    let mut unused: Vec<&String> = swaps
+                        .iter()
+                        .filter(|(rel, _)| !used_rel.contains(*rel))
+                        .map(|(_, p)| p)
+                        .collect();
+                    unused.sort();
+                    for p in unused {
+                        log(format!("  NS skin unused: {p}"));
+                    }
+                }
+                log(format!(
+                    "  NS swap: {swapped} package(s) of {} candidate(s); {upgraded} upgraded + {} skin effect asset(s) available",
+                    candidates.len(),
+                    swaps.len() - upgraded
+                ));
+            }
         }
 
         log("Packing IoStore mod into ~mods (UAssetTool)...".into());
@@ -545,6 +1245,79 @@ fn skin_overrides(
         .collect();
     let _ = std::fs::remove_dir_all(work);
     out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Replace `pat` by `rep` (same length) in a file when it occurs exactly once; returns the
+/// number of occurrences found.
+fn patch_unique(path: &Path, pat: &[u8], rep: &[u8]) -> Result<usize> {
+    ensure!(pat.len() == rep.len(), "patch length mismatch");
+    let mut data = std::fs::read(path)?;
+    let hits: Vec<usize> = data
+        .windows(pat.len())
+        .enumerate()
+        .filter(|(_, w)| *w == pat)
+        .map(|(i, _)| i)
+        .collect();
+    if hits.len() == 1 {
+        data[hits[0]..hits[0] + pat.len()].copy_from_slice(rep);
+        std::fs::write(path, data)?;
+    }
+    Ok(hits.len())
+}
+
+/// Stage `package` (a cue) at the default skin's path `target`. When it subclasses the
+/// default cue (its names include `target`), the default cue is first copied to
+/// `<target>_Base` and the skin's cue points at that copy. Returns whether it re-parented.
+fn place_cue(
+    game: &Game,
+    work_dir: &Path,
+    content_dir: &Path,
+    package: &str,
+    target: &str,
+    made: &mut HashSet<String>,
+) -> Result<bool> {
+    let cue = game.extract_package(package, &work_dir.join("extract"))?;
+    let inherits = names(&cue)?.iter().any(|n| n == target);
+    let mut renames = HashMap::new();
+    if inherits {
+        let base = format!("{target}_Base");
+        if made.insert(base.clone()) {
+            let def = game.extract_package(target, &work_dir.join("extract_default"))?;
+            stage(&def, content_dir, &base)?;
+            let bp = content_dir
+                .join(base.trim_start_matches("/Game/"))
+                .with_extension("uasset");
+            relocate_package(&bp, &base, &HashMap::new())?;
+        }
+        renames.insert(target.to_string(), base);
+    }
+    let dst = stage(&cue, content_dir, target)?;
+    relocate_package(&dst, target, &renames)?;
+    Ok(inherits)
+}
+
+/// The skin's cues that subclass the default skin's cue at the same path (the ones
+/// `swappable_cues` leaves out): (package, default path).
+pub fn inheriting_cues(
+    game: &Game,
+    work: &Path,
+    skin: &str,
+    default: &str,
+) -> Vec<(String, String)> {
+    let index = game.skins();
+    let (Some(own), Some(defaults)) = (index.cues.get(skin), index.cues.get(default)) else {
+        return vec![];
+    };
+    let mut out: Vec<(String, String)> = own
+        .iter()
+        .filter_map(|(rel, p)| {
+            let target = defaults.get(rel)?;
+            let names = names(&game.extract_package(p, work).ok()?).ok()?;
+            names.contains(target).then(|| (p.clone(), target.clone()))
+        })
+        .collect();
+    out.sort();
     out
 }
 
@@ -1273,6 +2046,15 @@ fn weapon_dir(pkg: &str) -> String {
         .unwrap_or("")
         .to_string()
 }
+/// ".../Weapons/Turret/Materials/MI_x" -> ".../weapons/turret_1p/materials/mi_x": the
+/// lowercased package of the first-person twin, as keyed in `SkinIndex::weapon_mats_1p`.
+fn first_person_key(pkg: &str) -> Option<String> {
+    let lower = pkg.to_ascii_lowercase();
+    let at = lower.find("/weapons/")? + "/weapons/".len();
+    let (dir, rest) = lower[at..].split_once('/')?;
+    Some(format!("{}{}_1p/{}", &lower[..at], dir, rest))
+}
+
 fn mi_key(slot: &str) -> String {
     let mut s = slot
         .to_ascii_lowercase()
@@ -1282,6 +2064,188 @@ fn mi_key(slot: &str) -> String {
         s.pop();
     }
     s
+}
+
+/// "MI_1014301_Shotgun_Weapon_02" -> "Shotgun_Weapon_02": the part after the 7-digit skin id.
+fn mi_slot(short: &str) -> Option<String> {
+    let parts: Vec<&str> = short.strip_prefix("MI_")?.split('_').collect();
+    let k = parts
+        .iter()
+        .position(|p| p.len() == 7 && p.bytes().all(|b| b.is_ascii_digit()))?;
+    let slot = parts[k + 1..].join("_");
+    (!slot.is_empty()).then_some(slot)
+}
+
+/// Reads a mesh's material slot order from its serialized `SkeletalMaterials` array
+/// (an i32 count, then per slot: material import index, slot-name FName, UV channel
+/// info), which is the real slot order; the import table's order is not. `imports` holds
+/// (class-name index, object-name index, object-name number) per import. Returns the
+/// `MI_...` names in slot order. A strict pass checks the expected slot layout; a
+/// relaxed one accepts any entry size that holds the same material references.
+fn scan_material_slots(
+    data: &[u8],
+    imports: &[(usize, usize, i32)],
+    names: &[String],
+) -> Option<Vec<String>> {
+    let int = |p: usize| -> Option<i32> {
+        data.get(p..p + 4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let mi_name = |imp: &(usize, usize, i32)| -> Option<String> {
+        let (class, object) = (names.get(imp.0)?, names.get(imp.1)?);
+        (class.starts_with("MaterialInstance") && object.starts_with("MI_")).then(|| {
+            if imp.2 > 0 {
+                format!("{object}_{}", imp.2 - 1)
+            } else {
+                object.clone()
+            }
+        })
+    };
+    for strict in [true, false] {
+        let strides: Vec<usize> = if strict {
+            vec![36, 32, 30, 28]
+        } else {
+            (20..=64).collect()
+        };
+        for p in 0..data.len().saturating_sub(4) {
+            let Some(n) = int(p).filter(|n| (2..=12).contains(n)) else {
+                continue;
+            };
+            let n = n as usize;
+            for &stride in &strides {
+                let mut found: Vec<String> = Vec::with_capacity(n);
+                let mut refs: Vec<i32> = Vec::with_capacity(n);
+                for k in 0..n {
+                    let q = p + 4 + k * stride;
+                    let Some(pidx) = int(q).filter(|v| *v < 0) else {
+                        break;
+                    };
+                    let Some(imp) = imports.get((-(pidx as i64) - 1) as usize) else {
+                        break;
+                    };
+                    let Some(m) = mi_name(imp) else { break };
+                    if refs.contains(&pidx) {
+                        break;
+                    }
+                    if strict {
+                        let name_ok = int(q + 4).is_some_and(|v| v >= 0 && (v as usize) < names.len());
+                        if !name_ok || !int(q + 8).is_some_and(|v| v >= 0) {
+                            break;
+                        }
+                    }
+                    refs.push(pidx);
+                    found.push(m);
+                }
+                if found.len() == n {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Debug text for a mesh whose slot order couldn't be read: where its material
+/// references sit in the export data and the bytes around them.
+fn slot_debug(uasset: &Path) -> String {
+    let run = || -> Result<String> {
+        let raw = std::fs::read(uasset)?;
+        let pos = summary_positions(&raw)?;
+        let names: Vec<String> = name_entries(&raw, &pos)?
+            .into_iter()
+            .map(|e| e.0)
+            .collect();
+        let import_offset = i32_at(&raw, pos["ImportOffset"])? as usize;
+        let import_count = i32_at(&raw, pos["ImportCount"])? as usize;
+        let mut mi: Vec<(usize, i32)> = vec![];
+        for i in 0..import_count {
+            let at = import_offset + i * 32;
+            let class = names.get(i32_at(&raw, at + 8)? as usize);
+            let object = names.get(i32_at(&raw, at + 20)? as usize);
+            if class.is_some_and(|c| c.starts_with("MaterialInstance"))
+                && object.is_some_and(|o| o.starts_with("MI_"))
+            {
+                mi.push((i, -(i as i32) - 1));
+            }
+        }
+        let exp = std::fs::read(uasset.with_extension("uexp")).ok();
+        let mut out = format!(
+            "uexp {} bytes; imports {import_count}; MI imports {:?}",
+            exp.as_ref().map_or(-1, |e| e.len() as i64),
+            mi.iter().map(|m| m.0).collect::<Vec<_>>()
+        );
+        if let Some(e) = &exp {
+            let int = |p: usize| {
+                e.get(p..p + 4)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            };
+            let mut shown = 0;
+            for p in 0..e.len().saturating_sub(4) {
+                let Some(v) = int(p) else { break };
+                if !mi.iter().any(|m| m.1 == v) {
+                    continue;
+                }
+                // Another, different MI reference 20..=64 bytes later: part of the slot list.
+                let next = (20..=64).find(|d| int(p + d).is_some_and(|w| w != v && mi.iter().any(|m| m.1 == w)));
+                if let Some(d) = next {
+                    let hex: Vec<String> = e[p.saturating_sub(8)..(p + d + 8).min(e.len())]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    out += &format!("\n      @{p} stride~{d}: {}", hex.join(" "));
+                    shown += 1;
+                    if shown >= 3 {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    };
+    run().unwrap_or_else(|e| format!("debug failed: {e}"))
+}
+
+/// Slot suffixes of a mesh's materials, in slot order, and how they were read.
+fn mi_slots(uasset: &Path) -> Result<(Vec<String>, &'static str)> {
+    let raw = std::fs::read(uasset)?;
+    let pos = summary_positions(&raw)?;
+    let names: Vec<String> = name_entries(&raw, &pos)?
+        .into_iter()
+        .map(|e| e.0)
+        .collect();
+    let import_offset = i32_at(&raw, pos["ImportOffset"])? as usize;
+    let import_count = i32_at(&raw, pos["ImportCount"])? as usize;
+    let mut imports = vec![];
+    for i in 0..import_count {
+        // 32-byte imports: ClassPackage, ClassName, OuterIndex, ObjectName (FNames + number).
+        let at = import_offset + i * 32;
+        imports.push((
+            i32_at(&raw, at + 8)? as usize,
+            i32_at(&raw, at + 20)? as usize,
+            i32_at(&raw, at + 24)?,
+        ));
+    }
+    let slots = |v: Vec<String>| v.iter().filter_map(|n| mi_slot(n)).collect::<Vec<_>>();
+    if let Ok(exp) = std::fs::read(uasset.with_extension("uexp")) {
+        if let Some(order) = scan_material_slots(&exp, &imports, &names) {
+            return Ok((slots(order), "slots"));
+        }
+    }
+    // Fallback: import-table order (not reliable, but better than nothing).
+    let order = imports
+        .iter()
+        .filter_map(|&(c, o, n)| {
+            let (class, object) = (names.get(c)?, names.get(o)?);
+            (class.starts_with("MaterialInstance") && object.starts_with("MI_")).then(|| {
+                if n > 0 {
+                    format!("{object}_{}", n - 1)
+                } else {
+                    object.clone()
+                }
+            })
+        })
+        .collect();
+    Ok((slots(order), "imports"))
 }
 
 fn mi_count(names: &[String]) -> usize {
