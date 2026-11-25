@@ -206,6 +206,33 @@ impl Game {
         Ok(script_imports(&self.store, package)? == script_imports(packed.as_ref(), target)?)
     }
 
+    /// Names of every game container (highest priority first) that holds this package.
+    pub fn containers_with(&self, package: &str) -> Vec<String> {
+        let mut id = bundle_chunk(package_id(package));
+        if let Some(v) = self.store.container_file_version() {
+            id = id.with_version(v);
+        }
+        self.store
+            .containers
+            .iter()
+            .filter(|c| c.has_chunk_id(id))
+            .map(|c| c.container_name().to_string())
+            .collect()
+    }
+
+    /// Which of `packages` ("/Game/...") a packed mod container actually holds: a package
+    /// counts when its export-bundle chunk can be read back from the container.
+    pub fn packed_contains(utoc: &Path, packages: &[String]) -> Result<Vec<(String, bool)>> {
+        let packed = iostore::open(utoc, Arc::new(Config::default()))?;
+        Ok(packages
+            .iter()
+            .map(|p| {
+                let ok = packed.read(bundle_chunk(package_id(p))).is_ok();
+                (p.clone(), ok)
+            })
+            .collect())
+    }
+
     /// The names a package refers to, straight from its zen header (name map
     /// plus imported package paths): no conversion to legacy format, no files
     /// written. Import object names aren't included (zen imports are hashes).
@@ -251,7 +278,7 @@ impl Game {
             let mesh_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/Mesh(?:es)?/(?:(\d{4,5})/)?SK_\d{4,5}_(\d{7})(_Lobby)?)\.uasset$").unwrap();
             let sound_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/(\d{7})_((?:GAS_)?SoundTable))\.uasset$").unwrap();
             let vfx_re = regex::Regex::new(r"Marvel/Content/Marvel/VFX/Particles/Characters/\d{4}/(\d{7})/").unwrap();
-            let cue_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/Cues/(.+))\.uasset$").unwrap();
+            let cue_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/Cues?/(.+))\.uasset$").unwrap();
             let lobby_mi_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/\d{4}/(\d{7})/Materials/(?:[^/]*/)?Lobby/(?:[^/]*/)?MI_(\d{7})_([^/]+))\.uasset$").unwrap();
             let bp_re = regex::Regex::new(r"/Characters/\d{4}/(\d{7})/(\d{7})_ChildBP\.uasset$").unwrap();
                         let girl_re = regex::Regex::new(r"Marvel/Content/(Marvel/Characters/(\d{4})/(\d{7})/\d{4}_Girl/Meshes/SK_\d{4}_Girl_(\d{7}))\.uasset$").unwrap();
