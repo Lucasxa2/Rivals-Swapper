@@ -672,7 +672,24 @@ pub fn create(
                         })
                         .any(|(_, d)| {
                             let dn = ns(d, &vfx);
-                            dn.iter().any(|r| !s.contains(r)) && s.iter().all(|r| dn.contains(r))
+                            if dn.iter().any(|r| !s.contains(r)) && s.iter().all(|r| dn.contains(r)) {
+                                return true;
+                            }
+                            // The skin brings new system(s) but the default cue has more
+                            // systems than the skin has new ones (Luna Snow's ult: the default
+                            // has Activation_01 + Loop_03, the skin only Floot_01 for the
+                            // floor). The name swap needs equal counts to pair them; the
+                            // skin's cue overrides one component of the default cue, so as a
+                            // subclass it reproduces exactly that. Opt-in (RS_UNPAIRED_SUBCLASS=1): in
+                            // Luna Snow's case the subclass made the whole cue disappear (no
+                            // floor, and the default's bars gone too); the name swap below
+                            // pairs the system the skin brings with the default's NS_Loop.
+                            if !feature("RS_UNPAIRED_SUBCLASS", false) {
+                                return false;
+                            }
+                            let s_only = s.iter().filter(|r| !dn.contains(*r)).count();
+                            let d_only = dn.iter().filter(|r| !s.contains(*r)).count();
+                            s_only > 0 && d_only > s_only
                         })
                 };
                 for (package, target) in
@@ -1330,6 +1347,44 @@ pub fn create(
                                         m.insert(dn.to_string(), sn.to_string());
                                     }
                                 }
+                            } else if feature("RS_UNPAIRED_PAIR", true)
+                                && s_only.len() == 1
+                                && d_only.len() > 1
+                                && d_only
+                                    .iter()
+                                    .filter(|n| {
+                                        n.rsplit('/').next().is_some_and(|f| {
+                                            f.to_ascii_lowercase().contains("loop")
+                                        })
+                                    })
+                                    .count()
+                                    == 1
+                            {
+                                // The skin brings one system where the default cue has several
+                                // (Luna Snow's ult: Activation_01 + Loop_03 against Floot_01):
+                                // the one it replaces is the looping one (the cue's NS_Loop).
+                                let (d, s) = (
+                                    d_only
+                                        .iter()
+                                        .find(|n| {
+                                            n.rsplit('/').next().is_some_and(|f| {
+                                                f.to_ascii_lowercase().contains("loop")
+                                            })
+                                        })
+                                        .copied()
+                                        .unwrap(),
+                                    s_only[0],
+                                );
+                                log(format!("  NS pair (loop): {file_name}: {d} -> {s}"));
+                                let m = extra.entry((*def).clone()).or_default();
+                                m.insert((*d).clone(), (*s).clone());
+                                let (dn, sn) = (
+                                    d.rsplit('/').next().unwrap_or(d.as_str()),
+                                    s.rsplit('/').next().unwrap_or(s.as_str()),
+                                );
+                                if dn != sn {
+                                    m.insert(dn.to_string(), sn.to_string());
+                                }
                             } else if !d_only.is_empty() || !s_only.is_empty() {
                                 log(format!(
                                     "  NS unpaired: {file_name}: default-only {d_only:?}, skin-only {s_only:?}"
@@ -1626,6 +1681,63 @@ pub fn create(
                     }
                     let label = file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                     match switch_notify_set(&file, &work_dir.join("switch"), tail, slot) {
+                        Ok((0, _)) if slot != 0 && feature("RS_PLAIN_SWITCH", true) => {
+                            // No unlockable set for the slot. The skin's plain set (SkinID =
+                            // tail, slot 0) is still the one the real skin plays; the default
+                            // set only names the effects the name swap could carry over. When
+                            // the skin's set names Niagara systems the default one has no
+                            // counterpart for (Luna Snow's skating: the skin's MoveLoop_02 and
+                            // _03, which the default's set can't show, while its MoveLoop_01
+                            // played twice and never stopped) play the skin's set instead.
+                            let pkg = file
+                                .strip_prefix(&content_dir)
+                                .ok()
+                                .map(|r| {
+                                    format!(
+                                        "/Game/{}",
+                                        r.with_extension("").to_string_lossy().replace('\\', "/")
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let hero = &skin[..4];
+                            let rels = |names: &[String], prefix: &str| -> HashSet<String> {
+                                names
+                                    .iter()
+                                    .filter(|n| n.starts_with(prefix))
+                                    .filter(|n| {
+                                        n.rsplit('/').next().is_some_and(|f| f.starts_with("NS_"))
+                                    })
+                                    .map(|n| n[prefix.len()..].to_ascii_lowercase())
+                                    .collect()
+                            };
+                            let orig = game.header_names(&pkg).unwrap_or_default();
+                            let skin_rels = rels(
+                                &orig,
+                                &format!("/Game/Marvel/VFX/Particles/Characters/{hero}/{skin}/"),
+                            );
+                            let def_rels = rels(
+                                &orig,
+                                &format!("/Game/Marvel/VFX/Particles/Characters/{hero}/{target_id}/"),
+                            );
+                            let own_only = skin_rels.iter().any(|r| !def_rels.contains(r));
+                            let res = if own_only {
+                                switch_notify_set(&file, &work_dir.join("switch"), tail, 0)
+                            } else {
+                                Ok((0, 0))
+                            };
+                            match res {
+                                Ok((0, _)) => log(format!(
+                                    "  Set switch: {label}: no notify set for slot {slot}"
+                                )),
+                                Ok((moved, parked)) => {
+                                    total += 1;
+                                    log(format!(
+                                        "  Set switch: {label}: skin's own set (slot 0): {moved} notify(ies) retagged to (1, 0), {parked} default one(s) parked"
+                                    ));
+                                }
+                                Err(e) => log(format!("  Set switch: {label} left as is: {e:#}")),
+                            }
+                        }
                         Ok((0, _)) => log(format!("  Set switch: {label}: no notify set for slot {slot}")),
                         Ok((moved, parked)) => {
                             total += 1;
