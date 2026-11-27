@@ -20,8 +20,8 @@ All Credits to the real creator of the app nyakuoff -The Goat-
 - **Weapons Fixed**
 - **Weapon NOT Fixed**: Deadpool change but has the wrong textures
 - **Repak-gui KawaiiPhysics implemented**: Now you doens't need to fix some skins using the repak-gui, with that custom VFX start appering some still bugged and need fix.
-- **VFX That Need Fixes**: Phoenix - Ice Phoenix, Storm - Marvel Tōkon: Fighting Souls, Luna Snow - Sonic Trailblazer, Jeff The Land Shark - Noob Nibbler, Rogue - Mrs. X and others.
-- **VFX That Does Work**: Scarlet Witch - Seaside Sorceress, Psylocke - Fleeting Butterfly, Spider-Man - Worthy Spider-Man, Hawkeye - Bed-Stuy's Best, Hela - Consort of Khonshu (not 100% sure).
+- **VFX That Need Fixes**: Phoenix - Ice Phoenix, Storm - Marvel Tōkon: Fighting Souls, Jeff The Land Shark - Noob Nibbler, and others.
+- **VFX That Does Work**: Scarlet Witch - Seaside Sorceress, Psylocke - Fleeting Butterfly, Luna Snow - Sonic Trailblazer, Rogue - Mrs. X, Spider-Man - Worthy Spider-Man, Hawkeye - Bed-Stuy's Best, Hela - Consort of Khonshu (not 100% sure).
 
 ## Prerequisites
 
